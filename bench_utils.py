@@ -28,15 +28,24 @@ SPARK_MEMORY = "8G"  # driver heap cap; Spark NLP's 16G default would compete wi
 ORDER = ("m2m100", "marian", "nllb")
 
 MODELS = {
-    "m2m100": dict(hf_id="facebook/m2m100_418M", task="text2text-generation",
+    "m2m100": dict(hf_id="facebook/m2m100_418M", precision="int8",
+                   onnx=("Xenova/m2m100_418M", "9c374f0b7aca709787cea97b047bfbbd1559d177"),
                    annotator="M2M100Transformer", src="pl", tgt="de", max_input=1024, batch=1),
-    "marian": dict(hf_id="Helsinki-NLP/opus-mt-pl-de", task="text2text-generation-with-past",
+    "marian": dict(hf_id="Helsinki-NLP/opus-mt-pl-de", precision="fp32", task="text2text-generation-with-past",
                    annotator="MarianTransformer", src=None, tgt=None, max_input=512, batch=4),
-    "nllb": dict(hf_id="facebook/nllb-200-distilled-600M", task="text2text-generation",
+    "nllb": dict(hf_id="facebook/nllb-200-distilled-600M", precision="int8",
+                 onnx=("Xenova/nllb-200-distilled-600M", "261c31d1a5732c67cdd16d80e8d6088507c7ccea"),
                  annotator="NLLBTransformer", src="pol_Latn", tgt="deu_Latn", max_input=1024, batch=1),
 }
 # Batch sizes, the same on both sides: Spark NLP 7.0.0's M2M100/NLLB can't batch (inputs aren't padded, and only the
 # first row of each batch gets a result), so they run one sentence at a time; Marian pads and batches correctly.
+# Precision, the same on both sides. M2M100 and NLLB run at int8: Spark NLP loads ready-made int8 ONNX builds of the
+# same checkpoints ("onnx": repo and pinned commit; ONNX Runtime dynamic quantization, int8 weights per channel), and
+# Hugging Face quantizes the checkpoint with PyTorch's dynamic int8. Exporting NLLB at fp32 needs about 14 GB, more
+# than Colab's 12.7 GB, and its fp32 decoder is over ONNX's 2 GB single-file limit, which Spark NLP 7.0.0 can't load.
+# Marian is small and is exported at fp32 ("task": optimum's export task).
+INT8_FILES = {"encoder_model.onnx": "onnx/encoder_model_quantized.onnx",
+              "decoder_model.onnx": "onnx/decoder_model_quantized.onnx"}
 
 TICKET_PL = "Cześć, jak się masz? Mam nadzieję, że masz wspaniały dzień."
 QUALITATIVE = [
@@ -173,6 +182,27 @@ def hf_pad_token_id(key):
     return AutoConfig.from_pretrained(MODELS[key]["hf_id"]).pad_token_id
 
 
+def hf_precision(model, key):
+    """Brings the Hugging Face model to the Spark NLP side's precision. int8: PyTorch's dynamic quantization of the
+    Linear layers (int8 weights, activations quantized on the fly), in place so the fp32 weights aren't kept twice."""
+    if MODELS[key]["precision"] != "int8":
+        return model
+    import torch
+
+    engines = torch.backends.quantized.supported_engines
+    if "fbgemm" not in engines and "qnnpack" in engines:  # ARM builds (local rehearsal); Colab's x86 has fbgemm
+        torch.backends.quantized.engine = "qnnpack"
+    return torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
+
+
+def load_hf(key):
+    """The Hugging Face model and tokenizer at MODELS[key]["precision"]; quantizing is part of the load."""
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    hf_id = MODELS[key]["hf_id"]
+    return hf_precision(AutoModelForSeq2SeqLM.from_pretrained(hf_id).eval(), key), AutoTokenizer.from_pretrained(hf_id)
+
+
 # ---- session ----------------------------------------------------------------------------------------------
 
 def stop_spark():
@@ -295,6 +325,25 @@ def _require(folder, name):
     if not os.path.exists(path):
         raise FileNotFoundError(f"{name} not found in {folder}")
     return path
+
+
+def fetch_int8_onnx(key, export_dir):
+    """Lays out export_dir as an export would: the int8 encoder/decoder from MODELS[key]["onnx"] under the names
+    loadSavedModel reads, plus the original checkpoint's config and tokenizer files. Also caches the checkpoint's
+    weights, which the Hugging Face side loads."""
+    import shutil
+
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    os.makedirs(export_dir, exist_ok=True)
+    repo, revision = MODELS[key]["onnx"]
+    for name, remote in INT8_FILES.items():
+        shutil.copy(hf_hub_download(repo, remote, revision=revision), os.path.join(export_dir, name))
+    checkpoint = snapshot_download(MODELS[key]["hf_id"], allow_patterns=["*.json", "*.model", "pytorch_model.bin"])
+    for name in ("config.json", "sentencepiece.bpe.model", "vocab.json"):  # NLLB has no vocab.json
+        if os.path.exists(os.path.join(checkpoint, name)):
+            shutil.copy(os.path.join(checkpoint, name), os.path.join(export_dir, name))
+    return sorted(os.listdir(export_dir))
 
 
 def prepare_assets(key, export_dir, vocab=None):
