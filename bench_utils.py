@@ -136,10 +136,11 @@ def prepare_flores(n=N_FULL):
     return DATA_TSV
 
 
-def load_sentences():
+def load_sentences(n=None):
+    """The first n sentence pairs (default: this pass's count, set by SMOKE)."""
     with open(DATA_TSV, encoding="utf-8", newline="") as f:
         rows = list(csv.reader(f, delimiter="\t"))[1:]
-    return [(int(i), pl, de) for i, pl, de in rows[:n_sentences()]]
+    return [(int(i), pl, de) for i, pl, de in rows[:n or n_sentences()]]
 
 
 # ---- fair settings ----------------------------------------------------------------------------------------
@@ -517,6 +518,69 @@ class CpuSampler:
 
 def peak(frame, phase_prefix, column):
     return round(float(frame[frame.phase.str.startswith(phase_prefix)][column].max()), 1)
+
+
+# ---- memory per sentence (the M2M100 leak notebook) -------------------------------------------------------
+
+def available_gb():
+    import psutil
+
+    return psutil.virtual_memory().available / 2**30
+
+
+def java_memory_mb(spark):
+    """The Java process's resident memory and its heap. What the heap doesn't hold is native memory, where ONNX
+    Runtime keeps its tensors."""
+    import psutil
+
+    runtime = spark._jvm.java.lang.Runtime.getRuntime()
+    committed, free = runtime.totalMemory(), runtime.freeMemory()
+    return {"java_rss_mb": round(psutil.Process(find_java_pid()).memory_info().rss / 2**20),
+            "heap_committed_mb": round(committed / 2**20), "heap_used_mb": round((committed - free) / 2**20)}
+
+
+def predicted_m2m100_leak_mb(out_tokens, vocab_size=128112):
+    """What one translation leaves behind if M2M100.getDecoderOutputs never closes its per-step outputs: the decoder
+    starts from 2 tokens (end-of-sentence, target language) and runs once per new token until end-of-sentence, so n
+    output tokens take n+1 runs over 2..n+2 positions, each returning vocab_size fp32 scores per position."""
+    positions = sum(range(2, out_tokens + 3))
+    return round(positions * vocab_size * 4 / 2**20, 1)
+
+
+def spark_memory_per_sentence(pipeline_model, spark, rows, tokenizer, key="m2m100", safety_gb=1.5):
+    """Translates rows one Spark job at a time and reads the Java process's memory after each. Stops early when the
+    machine has under safety_gb left: past that, Colab's out-of-memory killer ends Java and the readings are lost."""
+    import pandas as pd
+
+    records, before = [], java_memory_mb(spark)["java_rss_mb"]
+    for n, (i, text) in enumerate(rows, 1):
+        outputs, latencies = run_spark_single(pipeline_model, spark, [(i, text)])
+        memory, tokens = java_memory_mb(spark), hf_token_count(tokenizer, outputs.get(i, ""), key)
+        records.append({"n": n, "id": i, "seconds": round(latencies[i], 1), "out_tokens": tokens, **memory,
+                        "growth_mb": memory["java_rss_mb"] - before,
+                        "predicted_leak_mb": predicted_m2m100_leak_mb(tokens), "output": outputs.get(i, "")})
+        before = memory["java_rss_mb"]
+        r = records[-1]
+        print(f"{n:2d}: {tokens:3d} tokens in {r['seconds']:5.1f} s | Java {r['java_rss_mb']} MB (+{r['growth_mb']}, "
+              f"predicted +{r['predicted_leak_mb']:.0f}) | heap used {r['heap_used_mb']} MB", flush=True)
+        if available_gb() < safety_gb:
+            print(f"stopped after {n} of {len(rows)} sentences: under {safety_gb} GB of memory left on this machine")
+            break
+    return pd.DataFrame(records)
+
+
+def hf_memory_per_sentence(model, tokenizer, gen_config, key, rows):
+    """Translates rows one at a time with Hugging Face and reads this Python process's memory after each."""
+    import pandas as pd
+    import psutil
+
+    records, me = [], psutil.Process()
+    for n, (i, text) in enumerate(rows, 1):
+        outputs, latencies = run_hf_single(model, tokenizer, gen_config, key, [(i, text)])
+        records.append({"n": n, "id": i, "seconds": round(latencies[i], 1),
+                        "out_tokens": hf_token_count(tokenizer, outputs[i], key),
+                        "py_rss_mb": round(me.memory_info().rss / 2**20), "output": outputs[i]})
+    return pd.DataFrame(records)
 
 
 # ---- metrics ----------------------------------------------------------------------------------------------

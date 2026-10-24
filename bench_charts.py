@@ -217,6 +217,41 @@ def plot_latency_vs_length(results):
     return fig
 
 
+def plot_leak(spark_mem, hf_mem):
+    """The M2M100 leak notebook: memory after each sentence on both sides, then Spark NLP's measured growth per
+    sentence against the prediction for unclosed decoder outputs."""
+    from matplotlib.lines import Line2D
+
+    fig, (memory, growth) = _figure(2, row_height=3.0)
+    memory.plot(spark_mem["n"], spark_mem["java_rss_mb"], color=RUNTIME_COLOR["spark"], linewidth=2, marker="o",
+                markersize=8, markeredgecolor=SURFACE)
+    memory.plot(spark_mem["n"], spark_mem["heap_used_mb"], color=RUNTIME_COLOR["spark"], linewidth=2, linestyle="--")
+    memory.plot(hf_mem["n"], hf_mem["py_rss_mb"], color=RUNTIME_COLOR["hf"], linewidth=2, marker="o", markersize=8,
+                markeredgecolor=SURFACE)
+    memory.set_ylim(bottom=0)
+    memory.set_xlim(0.5, max(hf_mem["n"].max(), spark_mem["n"].max()) + 0.5)
+    _title(memory, "Memory after each sentence, translated one at a time")
+    _label(memory, "memory in use (MB)", "y")
+    _label(memory, "sentences translated", "x")
+
+    top = max(spark_mem["growth_mb"].max(), spark_mem["predicted_leak_mb"].max()) * 1.1
+    growth.plot([0, top], [0, top], color=AXIS, linewidth=1, linestyle=":")
+    growth.annotate("measured = predicted", (top * 0.62, top * 0.62), xytext=(6, -12), textcoords="offset points",
+                    fontsize=8.5, color=INK_2)
+    growth.scatter(spark_mem["predicted_leak_mb"], spark_mem["growth_mb"], s=60, color=RUNTIME_COLOR["spark"],
+                   edgecolors=SURFACE, linewidths=2, zorder=3)
+    growth.set_xlim(0, top)
+    growth.set_ylim(0, top)
+    _title(growth, "Spark NLP: memory added per sentence vs. the unclosed decoder outputs it predicts")
+    _label(growth, "predicted (MB)", "x")
+    _label(growth, "measured Java process growth (MB)", "y")
+
+    _legend(fig, [Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, marker="o", label="Java process (Spark NLP)"),
+                  Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, linestyle="--", label="Java heap in use"),
+                  Line2D([], [], color=RUNTIME_COLOR["hf"], linewidth=2, marker="o", label="Python process (HF)")])
+    return fig
+
+
 def save_figures(figs):
     folder = os.path.join(bench_utils.RESULTS_DIR, "charts")  # read at call time: ROOT can change on reload
     os.makedirs(folder, exist_ok=True)
