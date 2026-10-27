@@ -14,6 +14,7 @@ SURFACE, INK, INK_2, GRID, AXIS, CORE_INK = "#fcfcfb", "#0b0b0b", "#52514e", "#e
 RUNTIMES = ("spark", "hf")
 RUNTIME_NAME = {"spark": "Spark NLP", "hf": "HF Transformers"}
 RUNTIME_COLOR = {"spark": "#2a78d6", "hf": "#eb6834"}
+HF_ENGINE_NAME = {"onnxruntime": "HF + ONNX Runtime"}  # a run's config records its HF engine; PyTorch keeps the default
 MODEL_NAME = {"m2m100": "M2M100 418M", "marian": "Marian opus-mt-pl-de", "nllb": "NLLB 600M"}
 METRICS = ["bleu", "chrf", "load_s", "disk_mb", "latency_median_s", "latency_p95_s", "throughput_sps", "peak_rss_mb"]
 COLUMNS = ["model", "runtime", "bleu", "chrf", "spark_hf_match_pct", "load_s", "disk_mb",
@@ -75,14 +76,21 @@ def _legend(fig, handles):
                labelcolor=INK_2)
 
 
-def _runtime_handles(kind="patch"):
+def _runtime_names(results):
+    """RUNTIME_NAME, with the HF side named after its engine when every run recorded the same one."""
+    engines = {r["metrics"].get("config", {}).get("hf_engine") for r in results.values()}
+    engine = engines.pop() if len(engines) == 1 else None
+    return {**RUNTIME_NAME, "hf": HF_ENGINE_NAME.get(engine, RUNTIME_NAME["hf"])}
+
+
+def _runtime_handles(names, kind="patch"):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
     if kind == "dot":
         return [Line2D([], [], marker="o", linestyle="", markersize=7, markerfacecolor=RUNTIME_COLOR[rt],
-                       markeredgecolor=SURFACE, label=RUNTIME_NAME[rt]) for rt in RUNTIMES]
-    return [Patch(color=RUNTIME_COLOR[rt], label=RUNTIME_NAME[rt]) for rt in RUNTIMES]
+                       markeredgecolor=SURFACE, label=names[rt]) for rt in RUNTIMES]
+    return [Patch(color=RUNTIME_COLOR[rt], label=names[rt]) for rt in RUNTIMES]
 
 
 def _phase_spans(cpu):
@@ -109,10 +117,10 @@ def _shade_phases(ax, cpu):
                     va="bottom", fontsize=7.5, color=INK_2)
 
 
-def _phase_handles():
+def _phase_handles(names):
     from matplotlib.patches import Patch
 
-    return [Patch(color=RUNTIME_COLOR[rt], alpha=0.25, label=f"{RUNTIME_NAME[rt]} phases") for rt in RUNTIMES]
+    return [Patch(color=RUNTIME_COLOR[rt], alpha=0.25, label=f"{names[rt]} phases") for rt in RUNTIMES]
 
 
 def _grouped_bars(ax, results, metric, fmt=None):
@@ -149,7 +157,8 @@ def plot_cpu(results):
         _label(ax, "CPU %", "y")
     _label(axes[-1], "seconds since the section started", "x")
     _legend(fig, [Line2D([], [], color=CORE_INK, linewidth=1, label="each core"),
-                  Line2D([], [], color=INK, linewidth=2, label="mean of cores"), *_phase_handles()])
+                  Line2D([], [], color=INK, linewidth=2, label="mean of cores"),
+                  *_phase_handles(_runtime_names(results))])
     return fig
 
 
@@ -168,7 +177,7 @@ def plot_memory(results):
     _label(axes[-1], "seconds since the section started", "x")
     _legend(fig, [Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, label="Java process (Spark NLP)"),
                   Line2D([], [], color=RUNTIME_COLOR["hf"], linewidth=2, label="Python process (HF)"),
-                  *_phase_handles()])
+                  *_phase_handles(_runtime_names(results))])
     return fig
 
 
@@ -186,7 +195,7 @@ def plot_speed(results):
             latency.hlines(m["latency_p95_s"], x - 0.06, x + 0.06, color=INK, linewidth=1.5)
     _title(latency, "Single-sentence latency (lower is better)")
     _label(latency, "seconds (bar = median, whisker = p95)", "y")
-    _legend(fig, _runtime_handles())
+    _legend(fig, _runtime_handles(_runtime_names(results)))
     return fig
 
 
@@ -196,7 +205,7 @@ def plot_quality(results):
     _title(bleu, "BLEU vs FLORES reference")
     _grouped_bars(chrf, results, "chrf", "{:.1f}")
     _title(chrf, "chrF vs FLORES reference")
-    _legend(fig, _runtime_handles())
+    _legend(fig, _runtime_handles(_runtime_names(results)))
     return fig
 
 
@@ -213,7 +222,7 @@ def plot_latency_vs_length(results):
         _title(ax, MODEL_NAME.get(key, key))
         _label(ax, "output tokens", "x")
     _label(axes[0], "seconds per sentence", "y")
-    _legend(fig, _runtime_handles("dot"))
+    _legend(fig, _runtime_handles(_runtime_names(results), "dot"))
     return fig
 
 
@@ -246,7 +255,8 @@ def plot_leak(spark_mem, hf_mem):
     _label(growth, "predicted (MB)", "x")
     _label(growth, "measured Java process growth (MB)", "y")
 
-    _legend(fig, [Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, marker="o", label="Java process (Spark NLP)"),
+    _legend(fig, [Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, marker="o",
+                         label="Java process (Spark NLP)"),
                   Line2D([], [], color=RUNTIME_COLOR["spark"], linewidth=2, linestyle="--", label="Java heap in use"),
                   Line2D([], [], color=RUNTIME_COLOR["hf"], linewidth=2, marker="o", label="Python process (HF)")])
     return fig

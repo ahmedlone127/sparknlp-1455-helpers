@@ -206,6 +206,33 @@ def load_hf(key):
     return hf_precision(AutoModelForSeq2SeqLM.from_pretrained(hf_id).eval(), key), AutoTokenizer.from_pretrained(hf_id)
 
 
+def hf_onnx_model(export_dir):
+    """Optimum's ONNX Runtime model on the files Spark NLP loaded from export_dir, with Spark NLP's session settings
+    (all graph optimizations, sequential execution) and 2 threads, matching the 2 Spark tasks."""
+    import onnxruntime as ort
+    from optimum.onnxruntime import ORTModelForSeq2SeqLM
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 2
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ORTModelForSeq2SeqLM.from_pretrained(export_dir, session_options=options, provider="CPUExecutionProvider",
+                                                use_cache=True)
+
+
+def load_hf_onnx(key, export_dir):
+    """The Hugging Face side on ONNX Runtime: the exported files, and the checkpoint's tokenizer."""
+    from transformers import AutoTokenizer
+
+    return hf_onnx_model(export_dir), AutoTokenizer.from_pretrained(MODELS[key]["hf_id"])
+
+
+def onnx_files_mb(model):
+    """Size of the .onnx files an Optimum model loaded: encoder and decoder (and the decoder with past, if separate)."""
+    paths = (model.encoder_model_path, model.decoder_model_path, model.decoder_with_past_model_path)
+    return round(sum(os.path.getsize(p) for p in paths if p) / 2**20, 1)
+
+
 # ---- session ----------------------------------------------------------------------------------------------
 
 def stop_spark():
