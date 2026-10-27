@@ -18,7 +18,7 @@ ROOT = os.environ.get("SN1455_ROOT", "/content")
 RESULTS_DIR = os.path.join(ROOT, "sparknlp_1455_results")
 MODELS_DIR = os.path.join(ROOT, "models")
 EXPORT_DIR = os.path.join(ROOT, "export")
-DATA_TSV = os.path.join(ROOT, "pl_de_200.tsv")
+DATA_TSV = os.path.join(ROOT, "pl_de_flores.tsv")
 CONFIG_JSON = os.path.join(ROOT, "sn1455_config.json")
 FLORES_URL = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
 
@@ -66,15 +66,17 @@ HF_OVERRIDES = {"num_beams": 1, "do_sample": False, "min_length": 0, "no_repeat_
 
 # ---- run config -------------------------------------------------------------------------------------------
 
-def set_smoke(flag):
+def set_smoke(flag, n_full=N_FULL):
+    """SMOKE runs N_SMOKE sentences per model, the full pass n_full; saved to a file so it survives restarts."""
     os.makedirs(ROOT, exist_ok=True)
-    pathlib.Path(CONFIG_JSON).write_text(json.dumps({"smoke": bool(flag)}))
+    pathlib.Path(CONFIG_JSON).write_text(json.dumps({"smoke": bool(flag), "n_full": n_full}))
 
 
 def n_sentences():
     if not os.path.exists(CONFIG_JSON):
         return N_FULL
-    return N_SMOKE if json.loads(pathlib.Path(CONFIG_JSON).read_text()).get("smoke") else N_FULL
+    config = json.loads(pathlib.Path(CONFIG_JSON).read_text())
+    return N_SMOKE if config.get("smoke") else config.get("n_full", N_FULL)
 
 
 # ---- data -------------------------------------------------------------------------------------------------
