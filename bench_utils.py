@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import pathlib
+import sys
 import threading
 import time
 import urllib.request
@@ -244,23 +245,35 @@ def stop_spark():
     from pyspark import SparkContext
     from pyspark.sql import SparkSession
 
-    if SparkSession._instantiatedSession is not None:
-        SparkSession._instantiatedSession.stop()
-    elif SparkContext._active_spark_context is not None:
-        SparkContext._active_spark_context.stop()
-    gateway = SparkContext._gateway
-    if gateway is None:
-        return
-    gateway.shutdown()
-    proc = getattr(gateway, "proc", None)
-    if proc is not None:
-        proc.stdin.close()  # pyspark's JVM exits when its stdin closes
-        try:
-            proc.wait(timeout=60)
-        except Exception:
-            proc.kill()
-            proc.wait()
-    SparkContext._gateway = SparkContext._jvm = None  # the next SparkContext launches a new JVM
+    try:
+        if SparkSession._instantiatedSession is not None:
+            SparkSession._instantiatedSession.stop()
+        elif SparkContext._active_spark_context is not None:
+            SparkContext._active_spark_context.stop()
+        gateway = SparkContext._gateway
+        if gateway is None:
+            return
+        gateway.shutdown()
+        proc = getattr(gateway, "proc", None)
+        if proc is not None:
+            proc.stdin.close()  # pyspark's JVM exits when its stdin closes
+            try:
+                proc.wait(timeout=60)
+            except Exception:
+                proc.kill()
+                proc.wait()
+        SparkContext._gateway = SparkContext._jvm = None  # the next SparkContext launches a new JVM
+    finally:
+        _forget_spark_files()
+
+
+def _forget_spark_files():
+    """pyspark puts the jars Spark downloads on sys.path, inside Spark's userFiles folder, which Spark deletes when it
+    stops. A deleted archive left on sys.path makes pkgutil.iter_modules() raise KeyError after
+    importlib.invalidate_caches(), which loading Optimum's ONNX Runtime model does, so they go with the Java process."""
+    for path in [p for p in sys.path if f"{os.sep}userFiles-" in p]:
+        sys.path.remove(path)
+        sys.path_importer_cache.pop(path, None)
 
 
 def start_spark():
