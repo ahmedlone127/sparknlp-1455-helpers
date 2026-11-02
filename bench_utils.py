@@ -15,8 +15,33 @@ import threading
 import time
 import urllib.request
 
+
+def _writable_root(bases):
+    """The first <base>/sparknlp_1455 this Python can create. On a Unity Catalog cluster the notebook may run as a user
+    that can't write to /local_disk0 itself; the folder is opened to all users because Spark's Java process, which may
+    run as another user, saves the Spark NLP models in it."""
+    for base in bases:
+        path = os.path.join(base, "sparknlp_1455")
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.stat(path).st_uid == os.getuid():
+                os.chmod(path, 0o777)
+            return path
+        except OSError:
+            continue
+    raise PermissionError(f"none of {bases} lets this notebook create a folder for the benchmark's files")
+
+
 ON_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ  # set on every Databricks cluster
-ROOT = os.environ.get("SN1455_ROOT", "/local_disk0/sparknlp_1455" if ON_DATABRICKS else "/content")
+if "SN1455_ROOT" in os.environ:
+    ROOT = os.environ["SN1455_ROOT"]
+elif ON_DATABRICKS:
+    import tempfile
+
+    ROOT = _writable_root(("/local_disk0", tempfile.gettempdir()))  # the driver's local disk, else its temp folder
+    os.environ.setdefault("HF_HOME", os.path.join(ROOT, "hf_cache"))  # downloads next to the rest, not in ~
+else:
+    ROOT = "/content"
 RESULTS_DIR = os.path.join(ROOT, "sparknlp_1455_results")
 MODELS_DIR = os.path.join(ROOT, "models")
 EXPORT_DIR = os.path.join(ROOT, "export")
