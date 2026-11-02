@@ -15,7 +15,8 @@ RUNTIMES = ("spark", "hf")
 RUNTIME_NAME = {"spark": "Spark NLP", "hf": "HF Transformers"}
 RUNTIME_COLOR = {"spark": "#2a78d6", "hf": "#eb6834"}
 HF_ENGINE_NAME = {"onnxruntime": "HF + ONNX Runtime"}  # a run's config records its HF engine; PyTorch keeps the default
-MODEL_NAME = {"m2m100": "M2M100 418M", "marian": "Marian opus-mt-pl-de", "nllb": "NLLB 600M"}
+MODEL_NAME = {"m2m100": "M2M100 418M", "marian": "Marian opus-mt-pl-de", "nllb": "NLLB 600M",
+              "m2m100_fp32": "M2M100 418M (fp32)"}
 METRICS = ["bleu", "chrf", "load_s", "disk_mb", "latency_median_s", "latency_p95_s", "throughput_sps", "peak_rss_mb"]
 COLUMNS = ["model", "runtime", "bleu", "chrf", "spark_hf_match_pct", "load_s", "disk_mb",
            "latency_median_s", "latency_p95_s", "throughput_sps", "peak_rss_mb"]

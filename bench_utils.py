@@ -15,7 +15,8 @@ import threading
 import time
 import urllib.request
 
-ROOT = os.environ.get("SN1455_ROOT", "/content")
+ON_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ  # set on every Databricks cluster
+ROOT = os.environ.get("SN1455_ROOT", "/local_disk0/sparknlp_1455" if ON_DATABRICKS else "/content")
 RESULTS_DIR = os.path.join(ROOT, "sparknlp_1455_results")
 MODELS_DIR = os.path.join(ROOT, "models")
 EXPORT_DIR = os.path.join(ROOT, "export")
@@ -26,17 +27,20 @@ FLORES_URL = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
 N_FULL, N_SMOKE, N_SINGLE = 200, 20, 20
 MAX_OUT = 256
 SPARK_MEMORY = "8G"  # driver heap cap; Spark NLP's 16G default would compete with the HF model on Colab's ~12.7 GB
-ORDER = ("m2m100", "marian", "nllb")
+ORDER = ("m2m100", "marian", "nllb", "m2m100_fp32")
 
 MODELS = {
-    "m2m100": dict(hf_id="facebook/m2m100_418M", precision="int8",
+    "m2m100": dict(hf_id="facebook/m2m100_418M", family="m2m100", precision="int8",
                    onnx=("Xenova/m2m100_418M", "9c374f0b7aca709787cea97b047bfbbd1559d177"),
                    annotator="M2M100Transformer", src="pl", tgt="de", max_input=1024, batch=1),
-    "marian": dict(hf_id="Helsinki-NLP/opus-mt-pl-de", precision="fp32", task="text2text-generation-with-past",
+    "marian": dict(hf_id="Helsinki-NLP/opus-mt-pl-de", family="marian", precision="fp32",
+                   task="text2text-generation-with-past",
                    annotator="MarianTransformer", src=None, tgt=None, max_input=512, batch=4),
-    "nllb": dict(hf_id="facebook/nllb-200-distilled-600M", precision="int8",
+    "nllb": dict(hf_id="facebook/nllb-200-distilled-600M", family="nllb", precision="int8",
                  onnx=("Xenova/nllb-200-distilled-600M", "261c31d1a5732c67cdd16d80e8d6088507c7ccea"),
                  annotator="NLLBTransformer", src="pol_Latn", tgt="deu_Latn", max_input=1024, batch=1),
+    "m2m100_fp32": dict(hf_id="facebook/m2m100_418M", family="m2m100", precision="fp32", task="text2text-generation",
+                        annotator="M2M100Transformer", src="pl", tgt="de", max_input=1024, batch=1),
 }
 # Batch sizes, the same on both sides: Spark NLP 7.0.0's M2M100/NLLB can't batch (inputs aren't padded, and only the
 # first row of each batch gets a result), so they run one sentence at a time; Marian pads and batches correctly.
@@ -44,7 +48,8 @@ MODELS = {
 # same checkpoints ("onnx": repo and pinned commit; ONNX Runtime dynamic quantization, int8 weights per channel), and
 # Hugging Face quantizes the checkpoint with PyTorch's dynamic int8. Exporting NLLB at fp32 needs about 14 GB, more
 # than Colab's 12.7 GB, and its fp32 decoder is over ONNX's 2 GB single-file limit, which Spark NLP 7.0.0 can't load.
-# Marian is small and is exported at fp32 ("task": optimum's export task).
+# Marian is small and is exported at fp32 ("task": optimum's export task). m2m100_fp32 is M2M100 exported at fp32, for
+# the Databricks notebook, which has the memory for it; "family" is the architecture, which picks the settings.
 INT8_FILES = {"encoder_model.onnx": "onnx/encoder_model_quantized.onnx",
               "decoder_model.onnx": "onnx/decoder_model_quantized.onnx"}
 
@@ -154,7 +159,7 @@ def spark_settings(key, pad_token_id=None):
          "maxOutputLength": HF_OVERRIDES["max_new_tokens"],
          "noRepeatNgramSize": HF_OVERRIDES["no_repeat_ngram_size"],
          "repetitionPenalty": HF_OVERRIDES["repetition_penalty"]}
-    if key == "marian":  # greedy only, no minimum-length setting; input cap defaults to 40 tokens
+    if MODELS[key]["family"] == "marian":  # greedy only, no minimum-length setting; input cap defaults to 40 tokens
         s["maxInputLength"] = MODELS[key]["max_input"]
         if pad_token_id is not None:  # HF Marian bans the pad token through bad_words_ids
             s["ignoreTokenIds"] = [pad_token_id]
@@ -173,9 +178,9 @@ def apply_spark_settings(annotator, settings):
 def hf_generation_config(model, tokenizer, key):
     cfg = copy.deepcopy(model.generation_config)
     cfg.update(**HF_OVERRIDES)
-    if key == "m2m100":
+    if MODELS[key]["family"] == "m2m100":
         cfg.forced_bos_token_id = tokenizer.get_lang_id("de")
-    elif key == "nllb":
+    elif MODELS[key]["family"] == "nllb":
         cfg.forced_bos_token_id = tokenizer.convert_tokens_to_ids(MODELS[key]["tgt"])
     return cfg  # Marian keeps its bad_words_ids=[[pad]]
 
@@ -207,25 +212,28 @@ def load_hf(key):
     return hf_precision(AutoModelForSeq2SeqLM.from_pretrained(hf_id).eval(), key), AutoTokenizer.from_pretrained(hf_id)
 
 
-def hf_onnx_model(export_dir):
+def hf_onnx_model(export_dir, threads=2):
     """Optimum's ONNX Runtime model on the files Spark NLP loaded from export_dir, with Spark NLP's session settings
-    (all graph optimizations, sequential execution) and 2 threads, matching the 2 Spark tasks."""
+    (all graph optimizations, sequential execution) and as many threads as Spark has tasks (2 on Colab). The KV cache
+    is used when the export has one (Marian's merged decoder); M2M100's has none, so like Spark NLP it recomputes."""
     import onnxruntime as ort
     from optimum.onnxruntime import ORTModelForSeq2SeqLM
 
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 2
+    options.intra_op_num_threads = threads
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    has_past = any(os.path.exists(os.path.join(export_dir, f))
+                   for f in ("decoder_model_merged.onnx", "decoder_with_past_model.onnx"))
     return ORTModelForSeq2SeqLM.from_pretrained(export_dir, session_options=options, provider="CPUExecutionProvider",
-                                                use_cache=True)
+                                                use_cache=has_past)
 
 
-def load_hf_onnx(key, export_dir):
+def load_hf_onnx(key, export_dir, threads=2):
     """The Hugging Face side on ONNX Runtime: the exported files, and the checkpoint's tokenizer."""
     from transformers import AutoTokenizer
 
-    return hf_onnx_model(export_dir), AutoTokenizer.from_pretrained(MODELS[key]["hf_id"])
+    return hf_onnx_model(export_dir, threads), AutoTokenizer.from_pretrained(MODELS[key]["hf_id"])
 
 
 def onnx_files_mb(model):
@@ -242,6 +250,8 @@ def stop_spark():
     A new JVM frees the old model's memory, reads spark.jsl.settings again, and copies model files into a new folder
     (every export ships an encoder_model.onnx, and one JVM refuses a second, different file with that name).
     """
+    if ON_DATABRICKS:  # the cluster's Spark can't be stopped from a notebook; its Java process lives until a restart
+        return
     from pyspark import SparkContext
     from pyspark.sql import SparkSession
 
@@ -280,9 +290,14 @@ def start_spark():
     """Spark NLP with 1 ONNX thread per task; local[*] gives 2 tasks on Colab's 2 vCPUs, matching torch's 2.
 
     Any Spark already running in this kernel is stopped first, with its Java process, so a cell run twice starts clean.
+    On Databricks the cluster's Spark is returned as it is: its settings come from the cluster configuration.
     """
     import sparknlp
 
+    if ON_DATABRICKS:
+        from pyspark.sql import SparkSession
+
+        return SparkSession.builder.getOrCreate()
     stop_spark()
     params = {"spark.jsl.settings.onnx.intraOpNumThreads": "1"}
     jar = os.environ.get("SN1455_JAR")  # local rehearsal only
@@ -299,6 +314,8 @@ def config_summary(spark):
     return {"master": sc.master, "default_parallelism": sc.defaultParallelism,
             "onnx_intra_op_threads": spark.conf.get("spark.jsl.settings.onnx.intraOpNumThreads", None),
             "driver_memory": spark.conf.get("spark.driver.memory", None),
+            "java_heap_max_mb": round(spark._jvm.java.lang.Runtime.getRuntime().maxMemory() / 2**20)
+            if hasattr(spark, "_jvm") else None,
             "torch_threads": torch.get_num_threads(), "n_sentences": n_sentences()}
 
 
@@ -339,13 +356,18 @@ def load_exported(key, export_dir, spark):
     return _annotator_class(key).loadSavedModel(export_dir, spark)
 
 
+def spark_path(path):
+    """A local path as Spark should read or write it: Databricks' default file system is DBFS, so say file: there."""
+    return f"file:{path}" if ON_DATABRICKS else path
+
+
 def load_saved(key):
-    return _annotator_class(key).load(saved_model_path(key))
+    return _annotator_class(key).load(spark_path(saved_model_path(key)))
 
 
 def save_spark_model(annotator, key):
     path = saved_model_path(key)
-    annotator.write().overwrite().save(path)
+    annotator.write().overwrite().save(spark_path(path))
     return path
 
 
@@ -395,7 +417,7 @@ def prepare_assets(key, export_dir, vocab=None):
 
     assets = os.path.join(export_dir, "assets")
     os.makedirs(assets, exist_ok=True)
-    if key == "marian":
+    if MODELS[key]["family"] == "marian":
         for name in ("source.spm", "target.spm"):
             shutil.move(_require(export_dir, name), os.path.join(assets, name))
         tokens = json.loads(pathlib.Path(_require(export_dir, "vocab.json")).read_text(encoding="utf-8"))
@@ -406,7 +428,7 @@ def prepare_assets(key, export_dir, vocab=None):
         for name in ("begin_suppress_tokens", "suppress_tokens"):  # loadSavedModel reads both as int arrays
             config[name] = config.get(name) or []
         spm = _require(export_dir, "sentencepiece.bpe.model")
-        if key == "nllb":  # the checkpoint has no vocab.json; build it from the tokenizer
+        if MODELS[key]["family"] == "nllb":  # the checkpoint has no vocab.json; build it from the tokenizer
             if vocab is None:
                 from transformers import AutoTokenizer
 
@@ -491,9 +513,11 @@ def run_hf_single(model, tokenizer, gen_config, key, rows):
 # ---- CPU and memory sampling ------------------------------------------------------------------------------
 
 def find_java_pid():
+    """Spark's Java process: started by this Python process (pyspark), or, on Databricks, the one that started it."""
     import psutil
 
-    for p in psutil.Process().children(recursive=True):
+    me = psutil.Process()
+    for p in me.children(recursive=True) + me.parents():
         try:
             if "java" in p.name().lower():
                 return p.pid
